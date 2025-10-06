@@ -1,0 +1,19 @@
+runpod_worker_comfy:
+  base_path: /runpod-volume/ComfyUI
+  checkpoints: models/checkpoints/
+  clip: models/clip/
+  clip_vision: models/clip_vision/
+  configs: models/configs/
+  controlnet: models/controlnet/
+  embeddings: models/embeddings/
+  loras: models/loras/
+  upscale_models: models/upscale_models/
+  vae: models/vae/
+  unet: models/unet/
+  diffusion_models: models/diffusion_models/
+  face_parsing: models/face_parsing/
+  LLM: models/LLM/
+  mediapipe: models/mediapipe/
+  ultralytics: models/ultralytics/
+  vitmatte: models/vitmatte/
+  DiffuEraser: models/DiffuEraser/
