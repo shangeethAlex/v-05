@@ -1,6 +1,12 @@
 import runpod
 from runpod.serverless.utils import rp_upload
-import json, urllib.request, urllib.parse, time, os, requests, base64, shutil
+import json
+import urllib.request
+import urllib.parse
+import time
+import os
+import requests
+import base64
 from io import BytesIO
 
 # ==========================================
@@ -47,6 +53,7 @@ def validate_input(job_input):
 # SERVER CONNECTION
 # ==========================================
 def check_server(url, retries=500, delay=50):
+    """Check if ComfyUI API is reachable."""
     for _ in range(retries):
         try:
             response = requests.get(url)
@@ -62,77 +69,105 @@ def check_server(url, retries=500, delay=50):
 # ==========================================
 # FILE UPLOAD (Base64 or URL)
 # ==========================================
-def upload_inputs(inputs, job_id):
-    """Upload files (Base64 or via URL) into isolated job-specific directory."""
+def upload_inputs(inputs):
+    """Upload files (Base64 or via URL) to ComfyUI.
+    - Images → uploaded via /upload/image
+    - Videos → saved directly to /comfyui/input/
+    """
     if not inputs:
         return {"status": "success", "message": "No input files to upload", "details": []}
 
-    job_input_dir = f"/comfyui/input/{job_id}"
-    os.makedirs(job_input_dir, exist_ok=True)
+    responses = []
+    upload_errors = []
 
-    responses, upload_errors = [], []
     print("🚀 Uploading input file(s)...")
 
     for inp in inputs:
         name = inp.get("name")
         blob = None
-        save_path = os.path.join(job_input_dir, name)
 
         try:
+            # --- Case 1: URL-based upload ---
             if "url" in inp:
                 url = inp["url"]
                 print(f"📥 Downloading from URL: {url}")
                 with requests.get(url, stream=True) as r:
                     if r.status_code == 200:
-                        with open(save_path, "wb") as f:
+                        temp_path = f"/tmp/{name}"
+                        with open(temp_path, "wb") as f:
                             for chunk in r.iter_content(chunk_size=1024 * 1024):
                                 f.write(chunk)
-                        blob = open(save_path, "rb").read()
+                        blob = open(temp_path, "rb").read()
                     else:
                         upload_errors.append(f"Failed to download {name}: HTTP {r.status_code}")
                         continue
+
+            # --- Case 2: Base64-based upload ---
             elif "image" in inp:
                 blob = base64.b64decode(inp["image"])
-                with open(save_path, "wb") as f:
-                    f.write(blob)
+
             else:
                 upload_errors.append(f"No valid 'url' or 'image' found for {name}")
                 continue
 
-            upload_url = f"http://{COMFY_HOST}/upload/image"
+            # ==========================================
+            # Decide based on file type
+            # ==========================================
             if name.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
-                upload_url = f"http://{COMFY_HOST}/upload/video"
+                # 🔸 Directly save video file to input folder
+                dest_path = f"/comfyui/input/{name}"
+                with open(dest_path, "wb") as f:
+                    f.write(blob)
+                responses.append(f"✅ Saved video directly to {dest_path}")
+                print(f"✅ Video file saved: {dest_path}")
 
-            files = {
-                "image": (name, BytesIO(blob), "application/octet-stream"),
-                "overwrite": (None, "true"),
-            }
-
-            response = requests.post(upload_url, files=files)
-            if response.status_code != 200:
-                upload_errors.append(f"Error uploading {name}: {response.text}")
             else:
-                responses.append(f"✅ Uploaded {name}")
+                # 🔹 Use /upload/image for images
+                files = {
+                    "image": (name, BytesIO(blob), "application/octet-stream"),
+                    "overwrite": (None, "true"),
+                }
+                response = requests.post(f"http://{COMFY_HOST}/upload/image", files=files)
+
+                if response.status_code != 200:
+                    upload_errors.append(f"Error uploading {name}: {response.text}")
+                else:
+                    responses.append(f"✅ Uploaded {name} via /upload/image")
+                    print(f"✅ Image uploaded: {name}")
 
         except Exception as e:
             upload_errors.append(f"Error processing {name}: {str(e)}")
 
+    # ==========================================
+    # Summarize upload results
+    # ==========================================
     if upload_errors:
         print("⚠️ Upload completed with errors")
-        return {"status": "error", "message": "Some files failed", "details": upload_errors}
+        return {
+            "status": "error",
+            "message": "Some files failed to upload or save",
+            "details": upload_errors,
+            "success": responses,
+        }
 
     print("✅ All input files uploaded successfully")
-    return {"status": "success", "message": "All inputs uploaded successfully", "details": responses}
+    return {
+        "status": "success",
+        "message": "All inputs uploaded successfully",
+        "details": responses,
+    }
 
 # ==========================================
-# COMFYUI WORKFLOW
+# COMFYUI WORKFLOW QUEUE
 # ==========================================
 def queue_workflow(workflow):
+    """Queue a workflow for ComfyUI processing."""
     data = json.dumps({"prompt": workflow}).encode("utf-8")
     req = urllib.request.Request(f"http://{COMFY_HOST}/prompt", data=data)
     return json.loads(urllib.request.urlopen(req).read())
 
 def get_history(prompt_id):
+    """Retrieve history of a given ComfyUI prompt."""
     with urllib.request.urlopen(f"http://{COMFY_HOST}/history/{prompt_id}") as response:
         return json.loads(response.read())
 
@@ -140,13 +175,15 @@ def get_history(prompt_id):
 # UTILS
 # ==========================================
 def base64_encode(file_path):
+    """Convert file (image/video) to base64 string."""
     with open(file_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
 # ==========================================
-# OUTPUT HANDLER
+# PROCESS OUTPUT FILES
 # ==========================================
 def process_output_files(outputs, job_id):
+    """Collects generated image/video files and returns URLs or base64 strings."""
     COMFY_OUTPUT_PATH = os.environ.get("COMFY_OUTPUT_PATH", "/comfyui/output")
     bucket_url = os.environ.get("BUCKET_ENDPOINT_URL")
 
@@ -170,7 +207,8 @@ def process_output_files(outputs, job_id):
 
     results = []
     for item in output_files:
-        local_path, file_type = item["path"], item["type"]
+        local_path = item["path"]
+        file_type = item["type"]
         filename = os.path.basename(local_path)
 
         if not os.path.exists(local_path):
@@ -209,8 +247,8 @@ def process_output_files(outputs, job_id):
 # MAIN HANDLER
 # ==========================================
 def handler(job):
+    """Main RunPod handler that processes a ComfyUI workflow job."""
     job_input = job["input"]
-    job_id = job["id"]
 
     validated_data, error_message = validate_input(job_input)
     if error_message:
@@ -221,7 +259,7 @@ def handler(job):
 
     check_server(f"http://{COMFY_HOST}", COMFY_API_AVAILABLE_MAX_RETRIES, COMFY_API_AVAILABLE_INTERVAL_MS)
 
-    upload_result = upload_inputs(inputs, job_id)
+    upload_result = upload_inputs(inputs)
     if upload_result["status"] == "error":
         return upload_result
 
@@ -247,11 +285,7 @@ def handler(job):
         return {"error": f"Error polling workflow: {str(e)}"}
 
     outputs = history[prompt_id].get("outputs", {})
-    result_files = process_output_files(outputs, job_id)
-
-    # Cleanup job-specific input directory
-    job_input_dir = f"/comfyui/input/{job_id}"
-    shutil.rmtree(job_input_dir, ignore_errors=True)
+    result_files = process_output_files(outputs, job["id"])
 
     return {**result_files, "refresh_worker": REFRESH_WORKER}
 
